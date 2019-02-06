@@ -12,20 +12,36 @@ def int_shape(x):
 def concat_elu(x):
     """ like concatenated ReLU (http://arxiv.org/abs/1603.05201), but then with ELU """
     axis = len(x.get_shape())-1
-    return tf.nn.elu(tf.concat(axis, [x, -x]))
+    return tf.nn.elu(tf.concat([x, -x], axis))
 
 def log_sum_exp(x):
     """ numerically stable log_sum_exp implementation that prevents overflow """
     axis = len(x.get_shape())-1
     m = tf.reduce_max(x, axis)
-    m2 = tf.reduce_max(x, axis, keep_dims=True)
+    m2 = tf.reduce_max(x, axis, keepdims=True)
     return m + tf.log(tf.reduce_sum(tf.exp(x-m2), axis))
 
 def log_prob_from_logits(x):
     """ numerically stable log_softmax implementation that prevents overflow """
     axis = len(x.get_shape())-1
-    m = tf.reduce_max(x, axis, keep_dims=True)
-    return x - m - tf.log(tf.reduce_sum(tf.exp(x-m), axis, keep_dims=True))
+    m = tf.reduce_max(x, axis, keepdims=True)
+    return x - m - tf.log(tf.reduce_sum(tf.exp(x-m), axis, keepdims=True))
+
+def energy_distance(x, x_sample):
+    l1 = 0.
+    for xs in x_sample:
+        l1 += tf.reduce_sum(tf.pow(1e-10 + tf.reduce_sum(tf.square(127.5*(x-xs)),3), 0.75))
+    l1 /= len(x_sample)
+
+    l2 = 0.
+    n = 0
+    for i in range(len(x_sample)):
+        for j in range(i+1,len(x_sample)):
+            l2 += tf.reduce_sum(tf.pow(1e-10 + tf.reduce_sum(tf.square(127.5*(x_sample[i] - x_sample[j])), 3), 0.75))
+            n += 1
+    l2 /= n
+
+    return 2.*l1 - l2
 
 def discretized_mix_logistic_loss(x,l,sum_all=True):
     """ log-likelihood for mixture of discretized logistics, assumes the data has been rescaled to [-1,1] interval """
@@ -40,7 +56,7 @@ def discretized_mix_logistic_loss(x,l,sum_all=True):
     x = tf.reshape(x, xs + [1]) + tf.zeros(xs + [nr_mix]) # here and below: getting the means and adjusting them based on preceding sub-pixels
     m2 = tf.reshape(means[:,:,:,1,:] + coeffs[:, :, :, 0, :] * x[:, :, :, 0, :], [xs[0],xs[1],xs[2],1,nr_mix])
     m3 = tf.reshape(means[:, :, :, 2, :] + coeffs[:, :, :, 1, :] * x[:, :, :, 0, :] + coeffs[:, :, :, 2, :] * x[:, :, :, 1, :], [xs[0],xs[1],xs[2],1,nr_mix])
-    means = tf.concat(3,[tf.reshape(means[:,:,:,0,:], [xs[0],xs[1],xs[2],1,nr_mix]), m2, m3])
+    means = tf.concat([tf.reshape(means[:,:,:,0,:], [xs[0],xs[1],xs[2],1,nr_mix]), m2, m3],3)
     centered_x = x - means
     inv_stdv = tf.exp(-log_scales)
     plus_in = inv_stdv * (centered_x + 1./255.)
@@ -62,7 +78,7 @@ def discretized_mix_logistic_loss(x,l,sum_all=True):
     # tensorflow backpropagates through tf.select() by multiplying with zero instead of selecting: this requires use to use some ugly tricks to avoid potential NaNs
     # the 1e-12 in tf.maximum(cdf_delta, 1e-12) is never actually used as output, it's purely there to get around the tf.select() gradient issue
     # if the probability on a sub-pixel is below 1e-5, we use an approximation based on the assumption that the log-density is constant in the bin of the observed sub-pixel value
-    log_probs = tf.select(x < -0.999, log_cdf_plus, tf.select(x > 0.999, log_one_minus_cdf_min, tf.select(cdf_delta > 1e-5, tf.log(tf.maximum(cdf_delta, 1e-12)), log_pdf_mid - np.log(127.5))))
+    log_probs = tf.where(x < -0.999, log_cdf_plus, tf.where(x > 0.999, log_one_minus_cdf_min, tf.where(cdf_delta > 1e-5, tf.log(tf.maximum(cdf_delta, 1e-12)), log_pdf_mid - np.log(127.5))))
 
     log_probs = tf.reduce_sum(log_probs,3) + log_prob_from_logits(logit_probs)
     if sum_all:
@@ -90,7 +106,7 @@ def sample_from_discretized_mix_logistic(l,nr_mix):
     x0 = tf.minimum(tf.maximum(x[:,:,:,0], -1.), 1.)
     x1 = tf.minimum(tf.maximum(x[:,:,:,1] + coeffs[:,:,:,0]*x0, -1.), 1.)
     x2 = tf.minimum(tf.maximum(x[:,:,:,2] + coeffs[:,:,:,1]*x0 + coeffs[:,:,:,2]*x1, -1.), 1.)
-    return tf.concat(3,[tf.reshape(x0,xs[:-1]+[1]), tf.reshape(x1,xs[:-1]+[1]), tf.reshape(x2,xs[:-1]+[1])])
+    return tf.concat([tf.reshape(x0,xs[:-1]+[1]), tf.reshape(x1,xs[:-1]+[1]), tf.reshape(x2,xs[:-1]+[1])],3)
 
 def get_var_maybe_avg(var_name, ema, **kwargs):
     ''' utility for retrieving polyak averaged params '''
@@ -141,111 +157,107 @@ def get_name(layer_name, counters):
     return name
 
 @add_arg_scope
-def dense(x, num_units, nonlinearity=None, init_scale=1., counters={}, init=False, ema=None, **kwargs):
+def dense(x_, num_units, nonlinearity=None, init_scale=1., counters={}, init=False, ema=None, **kwargs):
     ''' fully connected layer '''
     name = get_name('dense', counters)
     with tf.variable_scope(name):
-        if init:
-            # data based initialization of parameters
-            V = tf.get_variable('V', [int(x.get_shape()[1]),num_units], tf.float32, tf.random_normal_initializer(0, 0.05), trainable=True)
-            V_norm = tf.nn.l2_normalize(V.initialized_value(), [0])
-            x_init = tf.matmul(x, V_norm)
-            m_init, v_init = tf.nn.moments(x_init, [0])
+        V = get_var_maybe_avg('V', ema, shape=[int(x_.get_shape()[1]),num_units], dtype=tf.float32,
+                              initializer=tf.random_normal_initializer(0, 0.05), trainable=True)
+        g = get_var_maybe_avg('g', ema, shape=[num_units], dtype=tf.float32,
+                              initializer=tf.constant_initializer(1.), trainable=True)
+        b = get_var_maybe_avg('b', ema, shape=[num_units], dtype=tf.float32,
+                              initializer=tf.constant_initializer(0.), trainable=True)
+
+        # use weight normalization (Salimans & Kingma, 2016)
+        x = tf.matmul(x_, V)
+        scaler = g / tf.sqrt(tf.reduce_sum(tf.square(V), [0]))
+        x = tf.reshape(scaler, [1, num_units]) * x + tf.reshape(b, [1, num_units])
+
+        if init: # normalize x
+            m_init, v_init = tf.nn.moments(x, [0])
             scale_init = init_scale/tf.sqrt(v_init + 1e-10)
-            g = tf.get_variable('g', dtype=tf.float32, initializer=scale_init, trainable=True)
-            b = tf.get_variable('b', dtype=tf.float32, initializer=-m_init*scale_init, trainable=True)
-            x_init = tf.reshape(scale_init,[1,num_units])*(x_init-tf.reshape(m_init,[1,num_units]))
-            if nonlinearity is not None:
-                x_init = nonlinearity(x_init)
-            return x_init
+            with tf.control_dependencies([g.assign(g*scale_init), b.assign_add(-m_init*scale_init)]):
+                # x = tf.identity(x)
+                x = tf.matmul(x_, V)
+                scaler = g / tf.sqrt(tf.reduce_sum(tf.square(V), [0]))
+                x = tf.reshape(scaler, [1, num_units]) * x + tf.reshape(b, [1, num_units])
 
-        else:
-            V,g,b = get_vars_maybe_avg(['V','g','b'], ema)
-            tf.assert_variables_initialized([V,g,b])
+        # apply nonlinearity
+        if nonlinearity is not None:
+            x = nonlinearity(x)
 
-            # use weight normalization (Salimans & Kingma, 2016)
-            x = tf.matmul(x, V)
-            scaler = g/tf.sqrt(tf.reduce_sum(tf.square(V),[0]))
-            x = tf.reshape(scaler,[1,num_units])*x + tf.reshape(b,[1,num_units])
-
-            # apply nonlinearity
-            if nonlinearity is not None:
-                x = nonlinearity(x)
-            return x
+        return x
 
 @add_arg_scope
-def conv2d(x, num_filters, filter_size=[3,3], stride=[1,1], pad='SAME', nonlinearity=None, init_scale=1., counters={}, init=False, ema=None, **kwargs):
+def conv2d(x_, num_filters, filter_size=[3,3], stride=[1,1], pad='SAME', nonlinearity=None, init_scale=1., counters={}, init=False, ema=None, **kwargs):
     ''' convolutional layer '''
     name = get_name('conv2d', counters)
     with tf.variable_scope(name):
-        if init:
-            # data based initialization of parameters
-            V = tf.get_variable('V', filter_size+[int(x.get_shape()[-1]),num_filters], tf.float32, tf.random_normal_initializer(0, 0.05), trainable=True)
-            V_norm = tf.nn.l2_normalize(V.initialized_value(), [0,1,2])
-            x_init = tf.nn.conv2d(x, V_norm, [1]+stride+[1], pad)
-            m_init, v_init = tf.nn.moments(x_init, [0,1,2])
-            scale_init = init_scale/tf.sqrt(v_init + 1e-8)
-            g = tf.get_variable('g', dtype=tf.float32, initializer=scale_init, trainable=True)
-            b = tf.get_variable('b', dtype=tf.float32, initializer=-m_init*scale_init, trainable=True)
-            x_init = tf.reshape(scale_init,[1,1,1,num_filters])*(x_init-tf.reshape(m_init,[1,1,1,num_filters]))
-            if nonlinearity is not None:
-                x_init = nonlinearity(x_init)
-            return x_init
+        V = get_var_maybe_avg('V', ema, shape=filter_size+[int(x_.get_shape()[-1]),num_filters], dtype=tf.float32,
+                              initializer=tf.random_normal_initializer(0, 0.05), trainable=True)
+        g = get_var_maybe_avg('g', ema, shape=[num_filters], dtype=tf.float32,
+                              initializer=tf.constant_initializer(1.), trainable=True)
+        b = get_var_maybe_avg('b', ema, shape=[num_filters], dtype=tf.float32,
+                              initializer=tf.constant_initializer(0.), trainable=True)
 
-        else:
-            V, g, b = get_vars_maybe_avg(['V', 'g', 'b'], ema)
-            tf.assert_variables_initialized([V,g,b])
+        # use weight normalization (Salimans & Kingma, 2016)
+        W = tf.reshape(g, [1, 1, 1, num_filters]) * tf.nn.l2_normalize(V, [0, 1, 2])
 
-            # use weight normalization (Salimans & Kingma, 2016)
-            W = tf.reshape(g,[1,1,1,num_filters])*tf.nn.l2_normalize(V,[0,1,2])
+        # calculate convolutional layer output
+        x = tf.nn.bias_add(tf.nn.conv2d(x_, W, [1] + stride + [1], pad), b)
 
-            # calculate convolutional layer output
-            x = tf.nn.bias_add(tf.nn.conv2d(x, W, [1]+stride+[1], pad), b)
+        if init:  # normalize x
+            m_init, v_init = tf.nn.moments(x, [0,1,2])
+            scale_init = init_scale / tf.sqrt(v_init + 1e-10)
+            with tf.control_dependencies([g.assign(g * scale_init), b.assign_add(-m_init * scale_init)]):
+                # x = tf.identity(x)
+                W = tf.reshape(g, [1, 1, 1, num_filters]) * tf.nn.l2_normalize(V, [0, 1, 2])
+                x = tf.nn.bias_add(tf.nn.conv2d(x_, W, [1] + stride + [1], pad), b)
 
-            # apply nonlinearity
-            if nonlinearity is not None:
-                x = nonlinearity(x)
-            return x
+        # apply nonlinearity
+        if nonlinearity is not None:
+            x = nonlinearity(x)
+
+        return x
 
 @add_arg_scope
-def deconv2d(x, num_filters, filter_size=[3,3], stride=[1,1], pad='SAME', nonlinearity=None, init_scale=1., counters={}, init=False, ema=None, **kwargs):
+def deconv2d(x_, num_filters, filter_size=[3,3], stride=[1,1], pad='SAME', nonlinearity=None, init_scale=1., counters={}, init=False, ema=None, **kwargs):
     ''' transposed convolutional layer '''
     name = get_name('deconv2d', counters)
-    xs = int_shape(x)
+    xs = int_shape(x_)
     if pad=='SAME':
         target_shape = [xs[0], xs[1]*stride[0], xs[2]*stride[1], num_filters]
     else:
         target_shape = [xs[0], xs[1]*stride[0] + filter_size[0]-1, xs[2]*stride[1] + filter_size[1]-1, num_filters]
     with tf.variable_scope(name):
-        if init:
-            # data based initialization of parameters
-            V = tf.get_variable('V', filter_size+[num_filters,int(x.get_shape()[-1])], tf.float32, tf.random_normal_initializer(0, 0.05), trainable=True)
-            V_norm = tf.nn.l2_normalize(V.initialized_value(), [0,1,3])
-            x_init = tf.nn.conv2d_transpose(x, V_norm, target_shape, [1]+stride+[1], padding=pad)
-            m_init, v_init = tf.nn.moments(x_init, [0,1,2])
-            scale_init = init_scale/tf.sqrt(v_init + 1e-8)
-            g = tf.get_variable('g', dtype=tf.float32, initializer=scale_init, trainable=True)
-            b = tf.get_variable('b', dtype=tf.float32, initializer=-m_init*scale_init, trainable=True)
-            x_init = tf.reshape(scale_init,[1,1,1,num_filters])*(x_init-tf.reshape(m_init,[1,1,1,num_filters]))
-            if nonlinearity is not None:
-                x_init = nonlinearity(x_init)
-            return x_init
+        V = get_var_maybe_avg('V', ema, shape=filter_size+[num_filters,int(x_.get_shape()[-1])], dtype=tf.float32,
+                              initializer=tf.random_normal_initializer(0, 0.05), trainable=True)
+        g = get_var_maybe_avg('g', ema, shape=[num_filters], dtype=tf.float32,
+                              initializer=tf.constant_initializer(1.), trainable=True)
+        b = get_var_maybe_avg('b', ema, shape=[num_filters], dtype=tf.float32,
+                              initializer=tf.constant_initializer(0.), trainable=True)
 
-        else:
-            V, g, b = get_vars_maybe_avg(['V', 'g', 'b'], ema)
-            tf.assert_variables_initialized([V,g,b])
+        # use weight normalization (Salimans & Kingma, 2016)
+        W = tf.reshape(g, [1, 1, num_filters, 1]) * tf.nn.l2_normalize(V, [0, 1, 3])
 
-            # use weight normalization (Salimans & Kingma, 2016)
-            W = tf.reshape(g,[1,1,num_filters,1])*tf.nn.l2_normalize(V,[0,1,3])
+        # calculate convolutional layer output
+        x = tf.nn.conv2d_transpose(x_, W, target_shape, [1] + stride + [1], padding=pad)
+        x = tf.nn.bias_add(x, b)
 
-            # calculate convolutional layer output
-            x = tf.nn.conv2d_transpose(x, W, target_shape, [1]+stride+[1], padding=pad)
-            x = tf.nn.bias_add(x, b)
+        if init:  # normalize x
+            m_init, v_init = tf.nn.moments(x, [0,1,2])
+            scale_init = init_scale / tf.sqrt(v_init + 1e-10)
+            with tf.control_dependencies([g.assign(g * scale_init), b.assign_add(-m_init * scale_init)]):
+                # x = tf.identity(x)
+                W = tf.reshape(g, [1, 1, num_filters, 1]) * tf.nn.l2_normalize(V, [0, 1, 3])
+                x = tf.nn.conv2d_transpose(x_, W, target_shape, [1] + stride + [1], padding=pad)
+                x = tf.nn.bias_add(x, b)
 
-            # apply nonlinearity
-            if nonlinearity is not None:
-                x = nonlinearity(x)
-            return x
+        # apply nonlinearity
+        if nonlinearity is not None:
+            x = nonlinearity(x)
+
+        return x
 
 @add_arg_scope
 def nin(x, num_units, **kwargs):
@@ -279,7 +291,7 @@ def gated_resnet(x, a=None, h=None, nonlinearity=concat_elu, conv=conv2d, init=F
             hw = hw.initialized_value()
         c2 += tf.reshape(tf.matmul(h, hw), [xs[0], 1, 1, 2 * num_filters])
 
-    a, b = tf.split(3, 2, c2)
+    a, b = tf.split(c2, 2, 3)
     c3 = a * tf.nn.sigmoid(b)
     return x + c3
 
@@ -287,11 +299,11 @@ def gated_resnet(x, a=None, h=None, nonlinearity=concat_elu, conv=conv2d, init=F
 
 def down_shift(x):
     xs = int_shape(x)
-    return tf.concat(1,[tf.zeros([xs[0],1,xs[2],xs[3]]), x[:,:xs[1]-1,:,:]])
+    return tf.concat([tf.zeros([xs[0],1,xs[2],xs[3]]), x[:,:xs[1]-1,:,:]],1)
 
 def right_shift(x):
     xs = int_shape(x)
-    return tf.concat(2,[tf.zeros([xs[0],xs[1],1,xs[3]]), x[:,:,:xs[2]-1,:]])
+    return tf.concat([tf.zeros([xs[0],xs[1],1,xs[3]]), x[:,:,:xs[2]-1,:]],2)
 
 @add_arg_scope
 def down_shifted_conv2d(x, num_filters, filter_size=[2,3], stride=[1,1], **kwargs):
